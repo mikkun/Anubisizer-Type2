@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+#
+# convert_list: CSVファイルをJSON形式に変換
+#
+# Written by KUSANAGI Mitsuhisa <mikkun@mbg.nifty.com> / Date: 2014-08-09
+
+# 環境変数を定義
+export LANG=ja_JP.utf8
+
+# シェル変数を定義
+work_dir=$(pwd)
+tmp=/tmp/$$
+
+# エイリアスを定義(OS Xのみ)
+if [ $(uname) = 'Darwin' ] ; then
+    alias awk='gawk'
+    alias sed='gsed'
+fi
+
+USAGE ()    # 使用方法表示
+{
+    cat<<END_USAGE 1>&2
+convert_list -f <CSVファイル> [-k] [-r|-s] -t <タイトル1,タイトル2...> [-y]
+
+-f CSVファイルを指定
+-k 結合する前のフィールドも合わせて出力
+-r 降順にソートして出力
+-s 昇順にソートして出力。-rと同時に使用した場合は-sが優先
+-t 2つ以上のタイトルを指定。指定した順番でフィールドを結合する
+-y YAML形式で出力(実験的機能)
+
+CSVのファイルをリストの形式(JSON)にコンバートする
+END_USAGE
+
+    # 終了時の処理
+    rm -fR $tmp-*
+    exit 1
+}
+
+CHECK ()    # エラー検知
+{
+    [ -z "$(echo ${PIPESTATUS[@]} | tr -d '0 ')" ] && return
+
+    # エラーメッセージを出力
+    echo "convert_list: $1" 1>&2
+
+    # 終了時の処理
+    rm -fR $tmp-*
+    exit 1
+}
+
+##############################################################################
+# オプションを解析
+while getopts ':f:krst:y' OPT ; do
+    case $OPT in
+        'f')
+            csv_file="$OPTARG"
+            ;;
+        'k')
+            touch $tmp-keep_original
+            ;;
+        'r')
+            touch $tmp-desc_sort
+            ;;
+        's')
+            touch $tmp-asc_sort
+            ;;
+        't')
+            titles="$OPTARG"
+            touch $tmp-has_titles
+            ;;
+        'y')
+            touch $tmp-output_yaml
+            ;;
+        *)
+            USAGE
+            ;;
+    esac
+done
+
+# merge_csv_fieldsとswap_csv_fieldsが実行可能か確認
+[ -x $work_dir/merge_csv_fields -a -x $work_dir/swap_csv_fields ]
+CHECK "実行にはmerge_csv_fieldsとswap_csv_fieldsが必要です"
+
+# CSVファイルが存在するか確認
+[ -f $csv_file ]
+CHECK "ファイル${csv_file}は存在しません"
+
+# -tオプションがあればタイトル文字列を処理
+if [ -f $tmp-has_titles ] ; then
+    titles=$(echo $titles | sed -e 's/^ \+//' -e 's/, \+/,/g' -e 's/,$//')
+    echo $titles | tr ',' '\n' > $tmp-titles
+    [ $(wc -l $tmp-titles | awk '{print $1}') -ge 2 ]
+    CHECK "-tオプションには2つ以上のタイトルが必要です"
+fi
+
+##############################################################################
+# -tオプションがあれば指定した順番でフィールドを結合
+cat $csv_file > $tmp-for_sort    # cpのエラーメッセージが邪魔なためcatでコピー
+if [ -f $tmp-has_titles -a -f $tmp-keep_original ] ; then
+    $work_dir/merge_csv_fields -f $csv_file -k -t $titles > $tmp-for_sort
+elif [ -f $tmp-has_titles ] ; then
+    $work_dir/merge_csv_fields -f $csv_file    -t $titles > $tmp-for_sort
+fi
+
+##############################################################################
+# ヘッダ部を切り離してから必要に応じてボディ部をソート
+head -n 1 $tmp-for_sort > $tmp-header
+if [ -f $tmp-asc_sort ] ; then                                    # 昇順ソート
+    tail -n +2 $tmp-for_sort | sort -t ',' -V  > $tmp-body
+elif [ -f $tmp-desc_sort ] ; then                                 # 降順ソート
+    tail -n +2 $tmp-for_sort | sort -t ',' -rV > $tmp-body
+else                                                              # 何もしない
+    tail -n +2 $tmp-for_sort                   > $tmp-body
+fi
+cat $tmp-header $tmp-body > $tmp-src_csv
+
+##############################################################################
+# CSVファイルをAWK等で処理しやすくする
+cat $tmp-src_csv                            |
+sed -e 's/^"//g' -e 's/,"/,/g'              |    # 先頭の「"」 は削除
+sed -e 's/"$//g' -e 's/",/,/g'              |    # 末尾の「"」 は削除
+sed -e 's/""/\\"/g'                         |    # 内側の「""」は「\"」に置換
+sed -e 'y/０１２３４５６７８９/0123456789/' |    # 全角数字 は 半角数字に置換
+sed -e 's/ /~~/g'                           |    #   「 」  は  「~~」 に置換
+tr ',' ' '                                  > $tmp-for_awk
+
+##############################################################################
+# JSONデータを生成(「~~」は「 」に戻す)
+cat $tmp-for_awk                                          |
+awk 'NR==1{print "[";n=split($0,k)}                       \
+     NR>=2{for(i=1;i<=n;i++){r=r"\""k[i]"\": \""$i"\", "} \
+          {sub(/, $/,"",r);print "    {"r"},";r=""}}'     |
+sed '$s/,$/\n]/'                                          |
+sed -e 's/~~/ /g' -e 's/": "\(-\?[0-9]\+\.[0-9]\+\|-\?[0-9]\+\)"/": \1/g' \
+    > $tmp-json
+
+# -yオプションがなければ、生成したJSONデータを出力して終了
+if [ ! -f $tmp-output_yaml ] ; then
+    cat $tmp-json
+    rm -fR $tmp-*
+    exit 0
+fi
+
+# JSONデータからYAMLデータを生成して出力
+cat $tmp-json |
+sed '1d'      |
+sed '$d'      |
+sed -e 's/^    {/- /' -e 's/},\?$//' -e 's/, /\n  /g'
+
+# 終了時の処理
+rm -fR $tmp-*
+exit 0

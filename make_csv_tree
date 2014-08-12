@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+#
+# make_csv_tree: CSVファイルのデータをツリー構造で出力
+#
+# Written by KUSANAGI Mitsuhisa <mikkun@mbg.nifty.com> / Date: 2014-08-09
+
+# 環境変数を定義
+export LANG=ja_JP.utf8
+
+# シェル変数を定義
+work_dir=$(pwd)
+tmp=/tmp/$$
+
+# エイリアスを定義(OS Xのみ)
+if [ $(uname) = 'Darwin' ] ; then
+    alias awk='gawk'
+    alias sed='gsed'
+fi
+
+USAGE ()    # 使用方法表示
+{
+    cat<<END_USAGE 1>&2
+make_csv_tree -f <CSVファイル> [-y]
+
+-f CSVファイルを指定
+-y YAML形式で出力
+
+CSVファイルのデータをツリー構造にて出力する
+END_USAGE
+
+    # 終了時の処理
+    rm -fR $tmp-*
+    exit 1
+}
+
+CHECK ()    # エラー検知
+{
+    [ -z "$(echo ${PIPESTATUS[@]} | tr -d '0 ')" ] && return
+
+    # エラーメッセージを出力
+    echo "make_csv_tree: $1" 1>&2
+
+    # 終了時の処理
+    rm -fR $tmp-*
+    exit 1
+}
+
+##############################################################################
+# オプションを解析
+while getopts ':f:y' OPT ; do
+    case $OPT in
+        'f')
+            csv_file="$OPTARG"
+            ;;
+        'y')
+            touch $tmp-output_yaml
+            ;;
+        *)
+            USAGE
+            ;;
+    esac
+done
+
+# CSVファイルが存在するか確認
+[ -f $csv_file ]
+CHECK "ファイル${csv_file}は存在しません"
+
+##############################################################################
+# 加工用ファイルを作成するための前処理を行う
+cat $csv_file                               |
+sed -e 's/^"//g' -e 's/,"/,/g'              |    # 先頭の「"」 は削除
+sed -e 's/"$//g' -e 's/",/,/g'              |    # 末尾の「"」 は削除
+sed -e 's/""/\\"/g'                         |    # 内側の「""」は「\"」に置換
+sed -e 'y/０１２３４５６７８９/0123456789/' |    # 全角数字 は 半角数字に置換
+sed -e 's/ /~~/g'                           |    #   「 」  は  「~~」 に置換
+tr  ',' ' '                                 > $tmp-for_tree
+
+##############################################################################
+# ファイルシステムを利用してツリー構造を表現するために、
+# 加工用ファイルのボディ部各行からディレクトリパスを生成
+tail -n +2 $tmp-for_tree |
+tr  -d '\0'              |    # ヌル文字は削除
+sed -e 's|/|／|g'        |    # 「/」は「／」に置換
+sed -e 's| |/|g'         > $tmp-dir_paths
+
+# 実際にディレクトリを作成
+cat $tmp-dir_paths |
+while read dir_path ; do
+    mkdir -p "$tmp-csv_tree_dir/$dir_path"
+done
+
+# 作成したディレクトリ群からツリー構造化データを生成
+cd $tmp-csv_tree_dir
+find . -type d                                      |
+sort -V                                             |
+sed -e 's/[^-][^\/]*\// |/g' -e 's/|\([^ ]\)/|-\1/' > $tmp-csv_tree-raw
+cd $work_dir
+
+##############################################################################
+# CSVファイルのフィールド数を調べる
+tail -n 1 $tmp-csv_tree-raw                   |
+sed  -e 's/^\([^-]\+\)-.*/\1/' -e 's/[^|]//g' |
+echo $(($(wc -c) - 1))                        > $tmp-field_count
+
+# -yオプションの有無に応じてツリー構造化データを出力
+if [ -f $tmp-output_yaml ] ; then                                   # YAML形式
+    cat $tmp-csv_tree-raw                                      |
+    sed -e '1d' -e 's/|-/|"/g' -e 's/$/":/g'                   |
+    sed -e '/^\( |\)\{'$(cat $tmp-field_count)'\}/s/:$//g'     |
+    sed -e '/^\( |\)\{'$(cat $tmp-field_count)'\}/s/|"/ - "/g' |
+    sed -e 's/ |/  /g' -e 's/^  //g' -e 's/~~/ /g'             |
+    sed -e 's/"\(-\?[0-9]\+\.[0-9]\+\|-\?[0-9]\+\)"/\1/g'      |
+    sed '/:$/s/^\( *\)\([^ ]*\):$/\1- \2\n\1-/g'    # 配列のネストに変形
+else                                                              # デフォルト
+    cat $tmp-csv_tree-raw                                         |
+    sed -e '1s#^.*# ./'$(head -n 1 $tmp-for_tree | tr ' ' '/')'#' |
+    sed -e 's/~~/ /g'
+fi
+
+# 終了時の処理
+rm -fR $tmp-*
+exit 0

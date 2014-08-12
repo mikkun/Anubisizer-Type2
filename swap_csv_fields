@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# swap_csv_fields: CSVファイルのフィールド順を変更
+#
+# Written by KUSANAGI Mitsuhisa <mikkun@mbg.nifty.com> / Date: 2014-08-09
+
+# 環境変数を定義
+export LANG=ja_JP.utf8
+
+# シェル変数を定義
+work_dir=$(pwd)
+tmp=/tmp/$$
+
+# エイリアスを定義(OS Xのみ)
+if [ $(uname) = 'Darwin' ] ; then
+    alias awk='gawk'
+    alias sed='gsed'
+fi
+
+# 定数を定義
+FIELD_LIMIT=100000
+
+USAGE ()    # 使用方法表示
+{
+    cat<<END_USAGE 1>&2
+swap_csv_fields -f <CSVファイル> [-r|-s] -t <タイトル1,タイトル2...>
+
+-f CSVファイルを指定
+-r 降順にソートして出力
+-s 昇順にソートして出力。-rと同時に使用した場合は-sが優先
+-t タイトルを指定。指定した順番でフィールドを並び替える
+
+CSVファイルのフィールドを指定した順番に並び替える
+END_USAGE
+
+    # 終了時の処理
+    rm -fR $tmp-*
+    exit 1
+}
+
+CHECK ()    # エラー検知
+{
+    [ -z "$(echo ${PIPESTATUS[@]} | tr -d '0 ')" ] && return
+
+    # エラーメッセージを出力
+    echo "swap_csv_fields: $1" 1>&2
+
+    # 終了時の処理
+    rm -fR $tmp-*
+    exit 1
+}
+
+##############################################################################
+# オプションを解析
+while getopts ':f:rst:' OPT ; do
+    case $OPT in
+        'f')
+            csv_file="$OPTARG"
+            ;;
+        'r')
+            touch $tmp-desc_sort
+            ;;
+        's')
+            touch $tmp-asc_sort
+            ;;
+        't')
+            titles="$OPTARG"
+            ;;
+        *)
+            USAGE
+            ;;
+    esac
+done
+
+# CSVファイルが存在するか確認
+[ -f $csv_file ]
+CHECK "ファイル${csv_file}は存在しません"
+
+# タイトル文字列を処理(「 」は「~~」に置換)
+echo $titles | sed -e 's/^ \+//' -e 's/, \+/,/g' -e 's/,$//' |
+tr ',' '\n'  | sed -e 's/ /~~/g'                             > $tmp-titles
+[ $(wc -c $tmp-titles | awk '{print $1}') -gt 1 ]
+CHECK "-tオプションには1つ以上のタイトルが必要です"
+
+##############################################################################
+# CSVファイルをAWK等で処理しやすくする
+cat $csv_file                               |
+sed -e 'y/０１２３４５６７８９/0123456789/' |    # 全角数字は半角数字に置換
+sed -e 's/ /~~/g'                           |    #  「 」  は 「~~」 に置換
+tr ',' ' '                                  > $tmp-for_awk
+
+##############################################################################
+# 行と列を転置
+for i in $(seq 1 $(head -n 1 $tmp-for_awk | wc -w)) ; do
+    awk '{print $'$i'}' $tmp-for_awk | tr '\n' ' ' >> $tmp-matrix-0
+    echo >> $tmp-matrix-0
+done
+
+# 第1フィールドにソート用番号を挿入
+field_num=0
+awk '{print '$FIELD_LIMIT'+NR" "$0}' $tmp-matrix-0 > $tmp-matrix-1
+cat $tmp-titles |
+while read title ; do
+    field_num=$(($field_num + 1))
+    awk '$2 ~ /^'$title'$/{$1='$field_num'}{print}' $tmp-matrix-$field_num \
+        > $tmp-matrix-$(($field_num + 1))
+    echo $(($field_num + 1)) > $tmp-last_num
+done
+
+# 第1フィールドの値でソート
+sort -V -k 1,1 $tmp-matrix-$(cat $tmp-last_num) |
+sed 's/^[0-9]\+ //g'                            > $tmp-matrix-sorted
+
+# 転置した行と列を元に戻す
+for i in $(seq 1 $(head -n 1 $tmp-matrix-sorted | wc -w)) ; do
+    awk '{print $'$i'}' $tmp-matrix-sorted | tr '\n' ' ' >> $tmp-swapped
+    echo >> $tmp-swapped
+done
+
+##############################################################################
+# ヘッダ部を切り離してから必要に応じてボディ部をソート
+head -n 1 $tmp-swapped > $tmp-header
+if [ -f $tmp-asc_sort ] ; then                                    # 昇順ソート
+    tail -n +2 $tmp-swapped | sort -V  > $tmp-body
+elif [ -f $tmp-desc_sort ] ; then                                 # 降順ソート
+    tail -n +2 $tmp-swapped | sort -rV > $tmp-body
+else                                                              # 何もしない
+    tail -n +2 $tmp-swapped            > $tmp-body
+fi
+cat $tmp-header $tmp-body > $tmp-sorted
+
+##############################################################################
+# 生成したCSVデータを出力(「~~」は「 」に戻す)
+cat $tmp-sorted | tr ' ' ',' | sed -e 's/~~/ /g' -e 's/,$//'
+
+# 終了時の処理
+rm -fR $tmp-*
+exit 0

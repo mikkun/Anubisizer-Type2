@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+#
+# convert_header: CSVファイルを見出し付きHTML形式に変換
+#
+# Written by KUSANAGI Mitsuhisa <mikkun@mbg.nifty.com> / Date: 2014-08-09
+
+# 環境変数を定義
+export LANG=ja_JP.utf8
+
+# シェル変数を定義
+work_dir=$(pwd)
+tmp=/tmp/$$
+
+# エイリアスを定義(OS Xのみ)
+if [ $(uname) = 'Darwin' ] ; then
+    alias awk='gawk'
+    alias sed='gsed'
+fi
+
+# 定数を定義
+DELIMITER=':'
+
+USAGE ()    # 使用方法表示
+{
+    cat<<END_USAGE 1>&2
+convert_header -f <CSVファイル> [-k] -t <タイトル1,タイトル2...>
+
+-f CSVファイルを指定
+-k 結合する前のフィールドも合わせて出力
+-t 2つ以上のタイトルを指定。指定した順番でフィールドを結合する
+
+CSVのファイルを見出し付きの表形式(HTML)にコンバートする
+END_USAGE
+
+    # 終了時の処理
+    rm -fR $tmp-*
+    exit 1
+}
+
+CHECK ()    # エラー検知
+{
+    [ -z "$(echo ${PIPESTATUS[@]} | tr -d '0 ')" ] && return
+
+    # エラーメッセージを出力
+    echo "convert_header: $1" 1>&2
+
+    # 終了時の処理
+    rm -fR $tmp-*
+    exit 1
+}
+
+##############################################################################
+SCAN_DIR ()    # ディレクトリ走査
+{
+    cd "$1"
+
+    # 子ディレクトリがなければ完了
+    if [ $(ls -U | wc -l) -eq 0 ] ; then
+        cat<<END_HTML >> $tmp-table_body
+            </tr>
+            <tr>
+END_HTML
+        cd ../
+        return
+    fi
+
+    # 子ディレクトリがあればデータセルを生成して再帰
+    ls -U | sort -V |    # lsではソートしない
+    while read sub_dir ; do
+        sub_dir_count=$(find "$sub_dir" -type d -empty | wc -l)
+        sub_dir_attr=''
+        echo -n "$sub_dir" | grep -Fq "$DELIMITER" && \
+            sub_dir_attr=' class="group"'
+        cat<<END_HTML >> $tmp-table_body
+                <td rowspan="$sub_dir_count"$sub_dir_attr>$sub_dir</td>
+END_HTML
+        SCAN_DIR "$sub_dir"
+    done
+    cd ../
+    return
+}
+
+##############################################################################
+# オプションを解析
+while getopts ':f:kt:' OPT ; do
+    case $OPT in
+        'f')
+            csv_file="$OPTARG"
+            ;;
+        'k')
+            touch $tmp-keep_original
+            ;;
+        't')
+            titles="$OPTARG"
+            touch $tmp-has_titles
+            ;;
+        *)
+            USAGE
+            ;;
+    esac
+done
+
+# merge_csv_fieldsとswap_csv_fieldsが実行可能か確認
+[ -x $work_dir/merge_csv_fields -a -x $work_dir/swap_csv_fields ]
+CHECK "実行にはmerge_csv_fieldsとswap_csv_fieldsが必要です"
+
+# CSVファイルが存在するか確認
+[ -f $csv_file ]
+CHECK "ファイル${csv_file}は存在しません"
+
+# CSVファイルの列数が2つ以上あるか確認
+[ $(head -n 1 $csv_file | tr ',' '\n' | wc -l) -ge 2 ]
+CHECK "使用するCSVファイルには2つ以上のデータ列が必要です"
+
+# -tオプションがあればタイトル文字列を処理
+if [ -f $tmp-has_titles ] ; then
+    titles=$(echo $titles | sed -e 's/^ \+//' -e 's/, \+/,/g' -e 's/,$//')
+    echo $titles | tr ',' '\n' > $tmp-titles
+    [ $(wc -l $tmp-titles | awk '{print $1}') -ge 2 ]
+    CHECK "-tオプションには2つ以上のタイトルが必要です"
+fi
+
+##############################################################################
+# -tオプションがあれば指定した順番でフィールドを結合
+cat $csv_file > $tmp-src_csv    # cpのエラーメッセージが邪魔なためcatでコピー
+if [ -f $tmp-has_titles -a -f $tmp-keep_original ] ; then
+    $work_dir/merge_csv_fields -f $csv_file -k -t $titles > $tmp-src_csv
+elif [ -f $tmp-has_titles ] ; then
+    $work_dir/merge_csv_fields -f $csv_file    -t $titles > $tmp-src_csv
+fi
+
+##############################################################################
+# 加工用ファイルを作成するための前処理を行う
+cat $tmp-src_csv                            |
+sed -e 's/^"//g' -e 's/,"/,/g'              |    # 先頭の「"」 は削除
+sed -e 's/"$//g' -e 's/",/,/g'              |    # 末尾の「"」 は削除
+sed -e 's/""/"/g'                           |    # 内側の「""」は「"」に置換
+sed -e 'y/０１２３４５６７８９/0123456789/' |    # 全角数字は 半角数字に置換
+sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g'  -e 's/>/\&gt;/g'  -e 's/"/\&quot;/g' \
+    -e "s/'/\&#39;/g" -e 's/+/\&#43;/g' -e 's/`/\&#96;/g'                    \
+    > $tmp-escaped_csv                           # HTMLエスケープ済ファイル
+
+##############################################################################
+# セクションの見出しとなるh1要素でtitle属性に使用する1番目のタイトルを抽出
+heading_title=$(head -n 1 $tmp-escaped_csv | tr ',' '\n' | head -n 1)
+
+# 「内訳」の表記を設定したロケールに合わせる
+details='Details'
+[ "_$LANG" = "_ja_JP.utf8" ] && details='内訳'
+
+# 表の見出し(2番目のタイトルからスタート)となるHTML断片を生成
+head -n 1 $tmp-escaped_csv |
+tr ',' '\n'                |
+tail -n +2                 |
+while read escaped_title ; do
+    if echo -n "$escaped_title" | grep -Fq "$DELIMITER" ; then
+        cat<<END_HTML >> $tmp-table_head
+                <th title="$escaped_title" class="group">$details</th>
+END_HTML
+    else
+        cat<<END_HTML >> $tmp-table_head
+                <th>$escaped_title</th>
+END_HTML
+    fi
+done
+
+##############################################################################
+# ファイルシステムを利用してツリー構造を表現するために、
+# 加工用ファイルのボディ部各行からディレクトリパスを生成
+tail -n +2 $tmp-escaped_csv |
+tr  -d '\0'                 |    # ヌル文字は削除
+sed -e 's|/|\&#47;|g'       |    # 「/」は「&#47;」にエスケープ
+sed -e 's|,|/|g'            > $tmp-dir_paths
+
+# 実際にディレクトリを作成
+cat $tmp-dir_paths |
+while read dir_path ; do
+    mkdir -p "$tmp-csv_tree_dir/$dir_path"
+done
+
+# ディレクトリを走査して見出し付きのHTML断片を生成
+cd $tmp-csv_tree_dir
+ls -U | sort -V |    # lsではソートしない
+while read tree_dir ; do
+    tree_dir_attr=" title=\"${heading_title}\""
+    echo -n "$tree_dir" | grep -Fq "$DELIMITER" && \
+        tree_dir_attr=" title=\"${heading_title}\" class=\"group\""
+    cat<<END_HTML >> $tmp-html_body
+    <section>
+        <h1$tree_dir_attr>$tree_dir</h1>
+        <table>
+            <tr>
+$(cat $tmp-table_head)
+            </tr>
+            <tr>
+END_HTML
+
+    # 子ディレクトリを走査して表形式のHTML断片を生成
+    SCAN_DIR "$tree_dir"
+    cat $tmp-table_body                        |
+    sed '$d'                                   |
+    sed -e 's/^\( \+\)<td rowspan="1"/\1<td/g' >> $tmp-html_body
+    rm -f $tmp-table_body
+
+    # 残りのHTML断片を生成
+    cat<<END_HTML >> $tmp-html_body
+        </table>
+    </section>
+END_HTML
+done
+cd $work_dir
+
+##############################################################################
+# HTMLデータをテンプレートに基づいて出力
+cat<<END_TEMPLATE
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8" />
+    <meta name="generator" content="Anubisizer-Type2" />
+    <title>HTML converted from CSV</title>
+    <style type="text/css">
+    body {
+        background-color: #FFFFFF;
+        color: #000000;
+        font-family: "Helvetica", sans-serif;
+    }
+    h1 {
+        font-size: large;
+        margin-bottom: 2px;
+        margin-top: 21px;
+    }
+    section:first-child > h1 {
+        margin-top: 0;
+    }
+    table {
+        border-bottom: 3px solid #000000;
+        border-collapse: collapse;
+        border-top: 3px solid #000000;
+        margin-left: 34px;
+    }
+    th, td {
+        padding: 3px 8px;
+        text-align: left;
+        vertical-align: baseline;
+    }
+    th {
+        border-bottom: 2px solid #000000;
+    }
+    td {
+        border-top: 1px solid #000000;
+    }
+    tr > td:first-child.group {
+        border-top: none;
+    }
+    </style>
+</head>
+<body>
+$(cat $tmp-html_body)
+</body>
+</html>
+END_TEMPLATE
+
+# 終了時の処理
+rm -fR $tmp-*
+exit 0

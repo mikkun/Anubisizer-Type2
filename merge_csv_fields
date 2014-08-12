@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+#
+# merge_csv_fields: CSVファイルのフィールドを結合する
+#
+# Written by KUSANAGI Mitsuhisa <mikkun@mbg.nifty.com> / Date: 2014-08-09
+
+# 環境変数を定義
+export LANG=ja_JP.utf8
+
+# シェル変数を定義
+work_dir=$(pwd)
+tmp=/tmp/$$
+
+# エイリアスを定義(OS Xのみ)
+if [ $(uname) = 'Darwin' ] ; then
+    alias awk='gawk'
+    alias sed='gsed'
+fi
+
+# 定数を定義
+DELIMITER=':'
+
+USAGE ()    # 使用方法表示
+{
+    cat<<END_USAGE 1>&2
+merge_csv_fields -f <CSVファイル> [-k|-o] [-r|-s] -t <タイトル1,タイトル2...>
+
+-f CSVファイルを指定
+-k 結合する前のフィールドも合わせて出力
+-o 結合したフィールドのみ出力。-kと同時に使用した場合は-oが優先
+-r 降順にソートして出力
+-s 昇順にソートして出力。-rと同時に使用した場合は-sが優先
+-t 2つ以上のタイトルを指定。指定した順番でフィールドを結合する
+
+CSVファイルのフィールドを指定した順番で結合する
+END_USAGE
+
+    # 終了時の処理
+    rm -fR $tmp-*
+    exit 1
+}
+
+CHECK ()    # エラー検知
+{
+    [ -z "$(echo ${PIPESTATUS[@]} | tr -d '0 ')" ] && return
+
+    # エラーメッセージを出力
+    echo "merge_csv_fields: $1" 1>&2
+
+    # 終了時の処理
+    rm -fR $tmp-*
+    exit 1
+}
+
+##############################################################################
+# オプションを解析
+while getopts ':f:korst:' OPT ; do
+    case $OPT in
+        'f')
+            csv_file="$OPTARG"
+            ;;
+        'k')
+            touch $tmp-keep_original
+            ;;
+        'o')
+            touch $tmp-merged_only
+            ;;
+        'r')
+            touch $tmp-desc_sort
+            ;;
+        's')
+            touch $tmp-asc_sort
+            ;;
+        't')
+            titles="$OPTARG"
+            ;;
+        *)
+            USAGE
+            ;;
+    esac
+done
+
+# swap_csv_fieldsが実行可能か確認
+[ -x $work_dir/swap_csv_fields ]
+CHECK "実行にはswap_csv_fieldsが必要です"
+
+# CSVファイルが存在するか確認
+[ -f $csv_file ]
+CHECK "ファイル${csv_file}は存在しません"
+
+# タイトル文字列を処理
+titles=$(echo $titles | sed -e 's/^ \+//' -e 's/, \+/,/g' -e 's/,$//')
+echo $titles | tr ',' '\n' > $tmp-titles
+[ $(wc -l $tmp-titles | awk '{print $1}') -ge 2 ]
+CHECK "-tオプションには2つ以上のタイトルが必要です"
+
+##############################################################################
+# -tオプションで指定した順番に並び替える
+$work_dir/swap_csv_fields -f $csv_file -t $titles > $tmp-swapped-0
+
+# タイトルの数に応じて「,」をデリミタ文字に置換
+count=0
+tail -n +2 $tmp-titles |    # 置換回数=タイトル数-1
+while read title ; do
+    sed 's/^\([^,]*\),\(.*\)/\1'$DELIMITER'\2/g' $tmp-swapped-$count \
+        > $tmp-swapped-$(($count + 1))
+    count=$(($count + 1))
+    echo $count > $tmp-last_count
+done
+mv -f $tmp-swapped-$(cat $tmp-last_count) $tmp-merged-raw
+
+##############################################################################
+# ファイル$tmp-merged-rawについて、出力時のフィールド順を設定
+head -n 1 $csv_file | tr ',' '\n' > $tmp-old_seq
+regex_titles=$(echo $titles | sed -e 's/,/\\|/g')
+new_field_title=$(echo $titles | tr ',' ':')
+cat $tmp-old_seq                                                            |
+sed '/^\('$regex_titles'\)$/s/^\(.*\)/'$new_field_title'\n\1/'              |
+tr  '\n' ','                                                                |
+sed -e 's/^/,/'                                                             |
+sed -e 's/,\('$new_field_title'\),/,\a\1,/' -e 's/,'$new_field_title',/,/g' |
+tr  -d '\a'                                                                 |
+sed -e 's/^,//' -e 's/,$//'                                                 \
+    > $tmp-new_seq-long
+
+# -oおよび-kオプションの有無に応じてCSVデータを生成
+if [ -f $tmp-merged_only ] ; then                               # -oオプション
+    cat $tmp-merged-raw |
+    awk 'BEGIN{FS=","}{print $1}' > $tmp-for_sort
+elif [ -f $tmp-keep_original ] ; then                           # -kオプション
+    cat $tmp-merged-raw           |
+    awk 'BEGIN{FS=","}{print $1}' > $tmp-merged_field
+    paste -d ',' $csv_file $tmp-merged_field > $tmp-pasted_csv
+    $work_dir/swap_csv_fields \
+        -f $tmp-pasted_csv -t $(cat $tmp-new_seq-long) > $tmp-for_sort
+else                                                              # デフォルト
+    cat $tmp-new_seq-long          |
+    tr  ',' '\n'                   |
+    sed '/^\('$regex_titles'\)$/d' |
+    tr  '\n' ','                   |
+    sed -e 's/,$//'                > $tmp-new_seq-short
+    $work_dir/swap_csv_fields \
+        -f $tmp-merged-raw -t $(cat $tmp-new_seq-short) > $tmp-for_sort
+fi
+
+##############################################################################
+# ヘッダ部を切り離してから必要に応じてボディ部をソート
+head -n 1 $tmp-for_sort > $tmp-header
+if [ -f $tmp-asc_sort ] ; then                                    # 昇順ソート
+    tail -n +2 $tmp-for_sort | sort -t ',' -V  > $tmp-body
+elif [ -f $tmp-desc_sort ] ; then                                 # 降順ソート
+    tail -n +2 $tmp-for_sort | sort -t ',' -rV > $tmp-body
+else                                                              # 何もしない
+    tail -n +2 $tmp-for_sort                   > $tmp-body
+fi
+cat $tmp-header $tmp-body
+
+# 終了時の処理
+rm -fR $tmp-*
+exit 0
